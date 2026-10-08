@@ -1,0 +1,44 @@
+# Example: passkey-gate in front of an app. Replace `app` with your
+# service, point your TLS-terminating reverse proxy at passkey-gate:3000
+# (not at the app), and keep the app itself off any published port.
+
+services:
+  passkey-gate:
+    image: ghcr.io/bobbykiselkov/passkey-gate:latest
+    # or build from source:
+    # build: .
+    container_name: passkey-gate
+    restart: unless-stopped
+    environment:
+      ORIGIN: ${ORIGIN:?set ORIGIN in .env}
+      UPSTREAM_URL: ${UPSTREAM_URL:-http://app:8080}
+      APP_NAME: ${APP_NAME:-My App}
+      RP_ID: ${RP_ID:-}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      SESSION_TTL_DAYS: ${SESSION_TTL_DAYS:-30}
+      INVITE_TTL_HOURS: ${INVITE_TTL_HOURS:-72}
+      TRUST_PROXY: ${TRUST_PROXY:-1}
+      GATE_PREFIX: ${GATE_PREFIX:-/__passkey}
+      PUBLIC_PATHS: ${PUBLIC_PATHS:-}
+      UPSTREAM_USER_HEADER: ${UPSTREAM_USER_HEADER:-}
+    volumes:
+      - passkey-gate-data:/data
+    # Reachable only by the reverse proxy on this network — never publish
+    # it directly, or clients could send their own X-Forwarded-* headers.
+    expose:
+      - "3000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  # app:
+  #   image: your/app
+  #   expose:
+  #     - "8080"
+
+volumes:
+  passkey-gate-data:
