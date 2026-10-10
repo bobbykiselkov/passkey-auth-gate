@@ -3,7 +3,7 @@ import { prefix } from './config';
 /** JSON call to the gate's API; throws with the server's error message. */
 export async function api<T = unknown>(
   path: string,
-  { method = 'GET', body }: { method?: 'GET' | 'POST'; body?: unknown } = {},
+  { method = 'GET', body }: { method?: 'GET' | 'POST' | 'DELETE'; body?: unknown } = {},
 ): Promise<T> {
   const res = await fetch(`${prefix}/api/${path}`, {
     method,

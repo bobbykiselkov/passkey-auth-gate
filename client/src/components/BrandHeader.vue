@@ -1,5 +1,5 @@
 <script setup lang="ts">
-defineProps<{ appName: string }>();
+withDefaults(defineProps<{ appName: string; subtitle?: string }>(), { subtitle: 'Private — passkey required' });
 </script>
 
 <template>
@@ -10,7 +10,7 @@ defineProps<{ appName: string }>();
       />
     </svg>
     <h1>{{ appName }}</h1>
-    <p class="muted">Private — passkey required</p>
+    <p class="muted">{{ subtitle }}</p>
   </header>
 </template>
 

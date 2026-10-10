@@ -16,7 +16,8 @@ import WebSocket, { WebSocketServer } from 'ws';
 
 import { type Gate, createGate } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
-import { GateDB } from '../src/db.js';
+import { GateDB, LastAdminError } from '../src/db.js';
+import Database from 'better-sqlite3';
 
 const b64u = (b: Uint8Array) => Buffer.from(b).toString('base64url');
 const sha256 = (b: string | Uint8Array) => createHash('sha256').update(b).digest();
@@ -319,7 +320,12 @@ describe('registration and sign-in', () => {
     const token = db.createInvite({ ttlHours: 1 });
     const res = await register(client, key, token, 'alice');
     assert.equal(res.status, 200, JSON.stringify(res.json));
-    assert.deepEqual((await client.call(`${PREFIX}/api/session`)).json, { authenticated: true, username: 'alice' });
+    // The very first account is always an admin.
+    assert.deepEqual((await client.call(`${PREFIX}/api/session`)).json, {
+      authenticated: true,
+      username: 'alice',
+      role: 'admin',
+    });
 
     // Single use.
     assert.equal((await register(new Client(), new SoftAuthenticator('localhost'), token, 'bob')).status, 400);
@@ -394,11 +400,144 @@ describe('registration and sign-in', () => {
 
   test('deleting a user cuts off their open sessions immediately', async () => {
     const c = new Client();
-    await login(c, key);
+    assert.equal((await register(c, new SoftAuthenticator('localhost'), db.createInvite({ ttlHours: 1 }), 'dave')).status, 200);
+    assert.equal(db.getUserByName('dave')!.role, 'user');
     assert.equal((await c.call('/Items')).status, 200);
-    db.deleteUser(db.getUserByName('alice')!.id);
+    db.deleteUser(db.getUserByName('dave')!.id);
     assert.equal((await c.call('/Items')).status, 401);
     assert.deepEqual(await c.ws(), { ok: false, status: 401 });
+  });
+});
+
+describe('roles and the admin API', () => {
+  const admin = new Client();
+  const adminKey = new SoftAuthenticator('localhost');
+  const member = new Client();
+  const A = `${PREFIX}/api/admin`;
+
+  before(async () => {
+    const alice = db.getUserByName('alice')!;
+    const token = db.createInvite({ ttlHours: 1, forUserId: alice.id });
+    assert.equal((await register(admin, adminKey, token)).status, 200);
+    assert.equal((await register(member, new SoftAuthenticator('localhost'), db.createInvite({ ttlHours: 1 }), 'bob')).status, 200);
+  });
+
+  test('anonymous visitors are sent to sign in, and back to the admin page after', async () => {
+    const anon = new Client();
+    const page = await anon.call(`${PREFIX}/admin`, { accept: 'text/html' });
+    assert.equal(page.status, 302);
+    assert.equal(page.headers.get('location'), `${PREFIX}/login?next=%2F__passkey%2Fadmin`);
+    assert.equal((await anon.call(`${A}/users`)).status, 401);
+
+    assert.equal((await login(new Client(), adminKey, `${PREFIX}/admin`)).json.redirect, `${PREFIX}/admin`);
+    assert.equal((await login(new Client(), adminKey, `${PREFIX}/api/admin/users`)).json.redirect, '/');
+  });
+
+  test('plain users get 403 from the admin page and API', async () => {
+    assert.equal((await member.call(`${PREFIX}/admin`, { accept: 'text/html' })).status, 403);
+    assert.equal((await member.call(`${A}/users`)).status, 403);
+    assert.equal((await member.call(`${A}/invites`, { method: 'POST', body: { role: 'admin' } })).status, 403);
+  });
+
+  test('admins get the admin page and the user list', async () => {
+    const page = await admin.call(`${PREFIX}/admin`, { accept: 'text/html' });
+    assert.equal(page.status, 200);
+    assert.match(page.json, /<title>Users · Test &lt;App&gt;<\/title>/);
+    assert.match(page.headers.get('content-security-policy')!, /script-src 'self'/);
+
+    const { users } = (await admin.call(`${A}/users`)).json;
+    assert.deepEqual(
+      users.map((u: { username: string; role: string }) => [u.username, u.role]),
+      [['alice', 'admin'], ['bob', 'user']],
+    );
+  });
+
+  test('role changes take effect on open sessions immediately', async () => {
+    const bob = db.getUserByName('bob')!;
+    assert.equal((await admin.call(`${A}/users/${bob.id}/role`, { method: 'POST', body: { role: 'admin' } })).status, 200);
+    assert.equal((await member.call(`${A}/users`)).status, 200);
+    assert.equal((await admin.call(`${A}/users/${bob.id}/role`, { method: 'POST', body: { role: 'user' } })).status, 200);
+    assert.equal((await member.call(`${A}/users`)).status, 403);
+    assert.equal((await admin.call(`${A}/users/${bob.id}/role`, { method: 'POST', body: { role: 'root' } })).status, 400);
+  });
+
+  test("admins can't change or delete their own account from the UI", async () => {
+    const alice = db.getUserByName('alice')!;
+    assert.equal((await admin.call(`${A}/users/${alice.id}/role`, { method: 'POST', body: { role: 'user' } })).status, 400);
+    assert.equal((await admin.call(`${A}/users/${alice.id}`, { method: 'DELETE' })).status, 400);
+    assert.equal(db.getUserById(alice.id)!.role, 'admin');
+  });
+
+  test('the last admin can never be demoted or deleted', () => {
+    const alice = db.getUserByName('alice')!;
+    assert.throws(() => db.setRole(alice.id, 'user'), LastAdminError);
+    assert.throws(() => db.deleteUser(alice.id), LastAdminError);
+  });
+
+  test('admin invites create accounts with the chosen role', async () => {
+    // Clear leftovers from earlier tests.
+    assert.equal((await admin.call(`${A}/invites`, { method: 'DELETE' })).status, 200);
+    assert.deepEqual((await admin.call(`${A}/invites`)).json.invites, []);
+
+    const res = await admin.call(`${A}/invites`, { method: 'POST', body: { role: 'admin', hours: 1 } });
+    assert.equal(res.status, 200);
+    const token = new URL(res.json.url).searchParams.get('invite')!;
+    assert.ok(res.json.url.startsWith(`${base}${PREFIX}/login?invite=`));
+
+    const listed = (await admin.call(`${A}/invites`)).json.invites;
+    assert.equal(listed.length, 1);
+    assert.equal(listed[0].role, 'admin');
+    assert.notEqual(listed[0].id, token, 'only the hash is ever listed');
+
+    assert.equal((await register(new Client(), new SoftAuthenticator('localhost'), token, 'erin')).status, 200);
+    assert.equal(db.getUserByName('erin')!.role, 'admin');
+    assert.equal((await admin.call(`${A}/invites`, { method: 'POST', body: { hours: 0 } })).status, 400);
+  });
+
+  test('invites can be revoked one at a time', async () => {
+    const { url } = (await admin.call(`${A}/invites`, { method: 'POST', body: {} })).json;
+    const token = new URL(url).searchParams.get('invite')!;
+    const [invite] = (await admin.call(`${A}/invites`)).json.invites;
+    assert.equal((await admin.call(`${A}/invites/${invite.id}`, { method: 'DELETE' })).status, 200);
+    assert.deepEqual((await admin.call(`${PREFIX}/api/invite?token=${token}`)).json, { valid: false });
+    assert.equal((await admin.call(`${A}/invites/${invite.id}`, { method: 'DELETE' })).status, 404);
+  });
+
+  test('admins can delete other users, but not cross-origin', async () => {
+    const bob = db.getUserByName('bob')!;
+    const evil = await admin.call(`${A}/users/${bob.id}`, { method: 'DELETE', origin: 'https://evil.example' });
+    assert.equal(evil.status, 403);
+    assert.equal((await admin.call(`${A}/users/${bob.id}`, { method: 'DELETE' })).status, 200);
+    assert.equal((await member.call('/Items')).status, 401);
+    assert.equal((await admin.call(`${A}/users/${bob.id}`, { method: 'DELETE' })).status, 404);
+  });
+});
+
+describe('database migration', () => {
+  test('a database from before roles gains role columns, defaulting to user', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'passkey-gate-migrate-'));
+    const old = new Database(path.join(dir, 'gate.db'));
+    old.exec(`
+      CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                          webauthn_user_id TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL);
+      CREATE TABLE invite_tokens (token TEXT PRIMARY KEY, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+                                  used INTEGER NOT NULL DEFAULT 0, used_at INTEGER,
+                                  for_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE);
+      INSERT INTO users (username, webauthn_user_id, created_at) VALUES ('old', 'x', 0);
+    `);
+    old.close();
+
+    const migrated = new GateDB(dir);
+    try {
+      assert.equal(migrated.getUserByName('old')!.role, 'user');
+      assert.equal(migrated.countAdmins(), 0);
+      assert.ok(migrated.setRole(migrated.getUserByName('old')!.id, 'admin'));
+      migrated.createInvite({ ttlHours: 1, role: 'admin' });
+      assert.equal(migrated.listInvites()[0]!.role, 'admin');
+    } finally {
+      migrated.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

@@ -58,3 +58,9 @@ input:focus-visible {
 .noscript {
   color: var(--danger);
 }
+
+a:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
