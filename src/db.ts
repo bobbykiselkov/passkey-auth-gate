@@ -11,11 +11,16 @@ import type { WebAuthnCredential } from '@simplewebauthn/server';
 import Database from 'better-sqlite3';
 import session from 'express-session';
 
+export const ROLES = ['admin', 'user'] as const;
+export type Role = (typeof ROLES)[number];
+export const isRole = (value: unknown): value is Role => ROLES.includes(value as Role);
+
 export interface User {
   id: number;
   username: string;
   /** WebAuthn user handle (base64url): random, never the row id or username. */
   webauthn_user_id: string;
+  role: Role;
   created_at: number;
 }
 
@@ -38,17 +43,27 @@ export interface Invite {
   used: number;
   used_at: number | null;
   for_user_id: number | null;
+  /** Role of the account a new-user invite creates. */
+  role: Role;
 }
 
 export interface UserSummary {
   id: number;
   username: string;
+  role: Role;
   created_at: number;
   passkeys: number;
   last_used_at: number | null;
 }
 
 export class InviteError extends Error {}
+
+/** Refused because it would leave the instance without an admin. */
+export class LastAdminError extends Error {
+  constructor() {
+    super('There must always be at least one admin. Promote someone else first.');
+  }
+}
 
 export const hashToken = (token: string): string => createHash('sha256').update(token).digest('hex');
 
@@ -57,6 +72,7 @@ const SCHEMA = `
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     username         TEXT    NOT NULL UNIQUE COLLATE NOCASE,
     webauthn_user_id TEXT    NOT NULL UNIQUE,
+    role             TEXT    NOT NULL DEFAULT 'user' CHECK (role IN ('admin', 'user')),
     created_at       INTEGER NOT NULL
   );
 
@@ -82,7 +98,8 @@ const SCHEMA = `
     used        INTEGER NOT NULL DEFAULT 0,
     used_at     INTEGER,
     -- NULL: invite creates a new user. Set: adds a passkey to this user.
-    for_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE
+    for_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    role        TEXT    NOT NULL DEFAULT 'user' CHECK (role IN ('admin', 'user'))
   );
 
   CREATE TABLE IF NOT EXISTS sessions (
@@ -92,6 +109,21 @@ const SCHEMA = `
   );
   CREATE INDEX IF NOT EXISTS sessions_expires ON sessions(expires);
 `;
+
+// Columns added after the first release. CREATE TABLE IF NOT EXISTS leaves
+// existing tables alone, so older databases get them here.
+const MIGRATIONS: { table: string; column: string; ddl: string }[] = [
+  {
+    table: 'users',
+    column: 'role',
+    ddl: "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('admin', 'user'))",
+  },
+  {
+    table: 'invite_tokens',
+    column: 'role',
+    ddl: "ALTER TABLE invite_tokens ADD COLUMN role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('admin', 'user'))",
+  },
+];
 
 export class GateDB {
   readonly db: Database.Database;
@@ -105,6 +137,10 @@ export class GateDB {
     this.db.pragma('foreign_keys = ON');
     this.db.pragma('busy_timeout = 5000');
     this.db.exec(SCHEMA);
+    for (const m of MIGRATIONS) {
+      const columns = this.db.prepare<[], { name: string }>(`PRAGMA table_info(${m.table})`).all();
+      if (!columns.some((c) => c.name === m.column)) this.db.exec(m.ddl);
+    }
   }
 
   close(): void {
@@ -124,7 +160,7 @@ export class GateDB {
   listUsers(): UserSummary[] {
     return this.db
       .prepare<[], UserSummary>(
-        `SELECT u.id, u.username, u.created_at,
+        `SELECT u.id, u.username, u.role, u.created_at,
                 COUNT(c.id) AS passkeys, MAX(c.last_used_at) AS last_used_at
          FROM users u LEFT JOIN credentials c ON c.user_id = u.id
          GROUP BY u.id ORDER BY u.id`,
@@ -132,10 +168,27 @@ export class GateDB {
       .all();
   }
 
+  countAdmins(): number {
+    return this.db.prepare<[], { n: number }>("SELECT COUNT(*) AS n FROM users WHERE role = 'admin'").get()!.n;
+  }
+
+  /** Throws LastAdminError rather than demote the only admin. */
+  setRole(id: number, role: Role): boolean {
+    return this.db.transaction(() => {
+      const user = this.getUserById(id);
+      if (!user) return false;
+      if (user.role === 'admin' && role !== 'admin' && this.countAdmins() <= 1) throw new LastAdminError();
+      this.db.prepare('UPDATE users SET role = ? WHERE id = ?').run(role, id);
+      return true;
+    })();
+  }
+
   /** Deletes the user, their passkeys and add-device invites (cascade) and
-   * their sessions (JSON blobs, so cleared explicitly). */
+   * their sessions (JSON blobs, so cleared explicitly). Throws
+   * LastAdminError rather than delete the only admin. */
   deleteUser(id: number): boolean {
     return this.db.transaction(() => {
+      if (this.getUserById(id)?.role === 'admin' && this.countAdmins() <= 1) throw new LastAdminError();
       this.db.prepare("DELETE FROM sessions WHERE json_extract(sess, '$.userId') = ?").run(id);
       return this.db.prepare('DELETE FROM users WHERE id = ?').run(id).changes > 0;
     })();
@@ -171,7 +224,8 @@ export class GateDB {
 
   /**
    * Atomically consumes the invite and stores the new passkey, creating the
-   * user first if the invite is for a new account. Throws InviteError if the
+   * user first if the invite is for a new account — with the invite's role,
+   * or as admin if it's the very first account. Throws InviteError if the
    * invite was used or expired in the meantime, or the username got taken.
    */
   registerCredential(input: {
@@ -193,10 +247,14 @@ export class GateDB {
       let userId = input.forUserId;
       if (userId === null) {
         if (this.getUserByName(input.username)) throw new InviteError('That username is already taken.');
+        const isFirstUser = !this.db.prepare('SELECT 1 FROM users LIMIT 1').get();
+        const inviteRole = this.db
+          .prepare<[string], { role: Role }>('SELECT role FROM invite_tokens WHERE token = ?')
+          .get(input.inviteHash)!.role;
         userId = Number(
           this.db
-            .prepare('INSERT INTO users (username, webauthn_user_id, created_at) VALUES (?, ?, ?)')
-            .run(input.username, input.webauthnUserId, now).lastInsertRowid,
+            .prepare('INSERT INTO users (username, webauthn_user_id, role, created_at) VALUES (?, ?, ?, ?)')
+            .run(input.username, input.webauthnUserId, isFirstUser ? 'admin' : inviteRole, now).lastInsertRowid,
         );
       } else if (!this.getUserById(userId)) {
         throw new InviteError('The account this invite was for no longer exists.');
@@ -226,13 +284,22 @@ export class GateDB {
 
   // ---- invites -------------------------------------------------------------
 
-  /** Returns the plaintext token — the only time it exists outside the link. */
-  createInvite({ ttlHours, forUserId = null }: { ttlHours: number; forUserId?: number | null }): string {
+  /** Returns the plaintext token — the only time it exists outside the link.
+   * `role` only matters for new-user invites. */
+  createInvite({
+    ttlHours,
+    forUserId = null,
+    role = 'user',
+  }: {
+    ttlHours: number;
+    forUserId?: number | null;
+    role?: Role;
+  }): string {
     const token = randomBytes(32).toString('base64url');
     const now = Date.now();
     this.db
-      .prepare('INSERT INTO invite_tokens (token, created_at, expires_at, for_user_id) VALUES (?, ?, ?, ?)')
-      .run(hashToken(token), now, now + ttlHours * 3600_000, forUserId);
+      .prepare('INSERT INTO invite_tokens (token, created_at, expires_at, for_user_id, role) VALUES (?, ?, ?, ?, ?)')
+      .run(hashToken(token), now, now + ttlHours * 3600_000, forUserId, role);
     return token;
   }
 
@@ -250,6 +317,14 @@ export class GateDB {
          WHERE i.used = 0 AND i.expires_at > ? ORDER BY i.created_at`,
       )
       .all(Date.now());
+  }
+
+  /** By token hash — what listInvites() returns, never the plaintext. */
+  revokeInvite(tokenHash: string): boolean {
+    return (
+      this.db.prepare('UPDATE invite_tokens SET used = 1, used_at = ? WHERE token = ? AND used = 0').run(Date.now(), tokenHash)
+        .changes > 0
+    );
   }
 
   revokeAllInvites(): number {

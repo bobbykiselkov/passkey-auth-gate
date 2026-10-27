@@ -187,9 +187,11 @@ This prints a single-use link such as
 username, and confirm the passkey prompt with Face ID, Touch ID, Windows
 Hello, your phone or a security key. You're signed in and sent to the app.
 
-Invite other people the same way, and send the link over a private
-channel. See the [admin CLI](#admin-cli) for adding devices and removing
-users.
+The first account is always an **admin**. Admins can invite people, add
+devices, change roles and remove users from the web UI at
+`https://media.example.com/__passkey/admin` (see [Users and roles](#users-and-roles)),
+or with the [admin CLI](#admin-cli). Send invite links over a private
+channel.
 
 ### 5. Tell the app to trust the gate
 
@@ -293,6 +295,28 @@ and others): the gate sets this header to the signed-in username, and always
 strips any value the client sent. Only enable it if the app can't be reached
 except through the gate. Otherwise anyone could send the header directly.
 
+## Users and roles
+
+Every account is either an `admin` or a `user`. Both can use the protected
+app; only admins can manage accounts. The very first account registered is
+always an admin, and the gate refuses to demote or delete the last one.
+
+Admins manage users at `GATE_PREFIX/admin` (linked from the signed-in page):
+
+- see every user with their role, passkey count and last sign-in
+- change a user's role, or delete them (their sessions end immediately)
+- create single-use invite links for new users or admins, and device links
+  that add a passkey to an existing account
+- list and revoke open invites
+
+Admins can't change or delete their own account from the UI, so nobody
+locks themselves out by accident. Another admin, or the CLI, can do it.
+Roles are re-read from the database on every request, so a demotion takes
+effect at once.
+
+**Upgrading from a version without roles:** existing accounts become
+`user`. Promote yourself once with `passkey-gate set-role <you> admin`.
+
 ## Admin CLI
 
 Inside the container, `passkey-gate` is on the `PATH`:
@@ -300,10 +324,12 @@ Inside the container, `passkey-gate` is on the `PATH`:
 ```bash
 passkey-gate invite                     # new user, link valid INVITE_TTL_HOURS
 passkey-gate invite --hours 24
+passkey-gate invite --role admin        # new admin
 passkey-gate invite --user alice        # add a passkey to alice (new device / lost phone)
 passkey-gate invites                    # open invites
 passkey-gate revoke-invites
-passkey-gate users
+passkey-gate users                      # with roles
+passkey-gate set-role alice admin       # or: user
 passkey-gate delete-user alice          # passkeys gone, open sessions cut off immediately
 ```
 
@@ -318,15 +344,26 @@ Everything below lives under `GATE_PREFIX`. Everything else is proxied.
 | Route | |
 |---|---|
 | `GET  /login` | Login page. `?next=/path` sets where to return after sign-in. `?invite=TOKEN` shows registration. |
+| `GET  /admin` | User management page. Admins only: others get `403`, anonymous visitors are sent to sign in. |
 | `GET  /health` | `ok`, for container health checks. Unauthenticated. |
-| `GET  /assets/*` | The login page's built JS/CSS (content-hashed, cached for a year). |
-| `GET  /api/session` | `{ authenticated, username }` |
+| `GET  /assets/*` | The login and admin pages' built JS/CSS (content-hashed, cached for a year). |
+| `GET  /api/session` | `{ authenticated, username, role }` |
 | `GET  /api/invite?token=` | `{ valid, forUsername }` |
 | `GET  /api/generate-auth-options` | WebAuthn authentication options. The challenge is stored in the session. |
 | `POST /api/verify-auth` | Verifies the assertion, updates the signature counter and starts a session. |
 | `GET  /api/generate-reg-options?token=&username=` | Registration options. Needs a valid invite. |
 | `POST /api/verify-reg` | Verifies the attestation, stores the passkey, consumes the invite and starts a session. |
 | `POST /api/logout` | Ends the session. |
+| `GET  /api/admin/users` | Users with role, passkey count and last sign-in. |
+| `POST /api/admin/users/:id/role` | `{ role: "admin" \| "user" }`. |
+| `DELETE /api/admin/users/:id` | Deletes the user, their passkeys and sessions. |
+| `GET  /api/admin/invites` | Open invites (by token hash, never the token). |
+| `POST /api/admin/invites` | `{ hours?, role?, forUserId? }` → `{ url, expiresAt }`. |
+| `DELETE /api/admin/invites/:id` | Revokes one invite. `DELETE /api/admin/invites` revokes all. |
+
+`/api/admin/*` needs an admin session (`401` without a session, `403` for
+plain users) and, like every non-`GET` API call, a same-origin `Origin`
+header.
 
 Unauthenticated `GET`/`HEAD` requests that accept HTML get a `302` to the
 login page. Everything else gets a `401`, and WebSocket upgrades are refused
@@ -404,7 +441,8 @@ the client IP: `docker compose logs -f passkey-gate`.
 docker compose pull passkey-gate && docker compose up -d passkey-gate
 ```
 
-The database schema is created and kept up to date on start. Back up the
+The database schema is created and kept up to date on start (new columns
+are added in place). Back up the
 `/data` volume (`gate.db`, plus `session-secret` if you didn't set
 `SESSION_SECRET`). Restoring it brings back all users and passkeys.
 Sessions survive restarts and upgrades.
@@ -580,16 +618,20 @@ src/
   config.ts   environment → validated config
   db.ts       SQLite schema, queries, session store
   cli.ts      admin CLI
-client/                 Vue login page (Vite root) → dist/public
-  index.html            page template ({{APP_NAME}}, {{PREFIX}} filled in by the server)
+client/                 Vue login + admin pages (Vite root) → dist/public
+  index.html            login page template ({{APP_NAME}}, {{PREFIX}} filled in by the server)
+  admin.html            admin page template
   src/
-    main.ts             app entry
+    main.ts             login page entry
     App.vue             page state: loading / signed in / sign in + invite
+    admin.ts            admin page entry
+    admin/              AdminApp, UsersTable, InvitesPanel
     style.css           theme tokens and base styles
     components/         BrandHeader, StatusBanner, PasskeyButton,
                         SignedInCard, RegisterForm
     lib/
       passkey.ts        WebAuthn ceremonies (@simplewebauthn/browser), session calls
+      admin.ts          admin API calls
       api.ts            fetch wrapper for the gate's API
       config.ts         reads the prefix and app name from <meta> tags
 vite.config.ts

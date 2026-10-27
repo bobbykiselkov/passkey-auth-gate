@@ -88,6 +88,10 @@ function parseOrigin(raw: string): string {
   return url.origin;
 }
 
+/** The single-use registration link for an invite token. */
+export const inviteUrl = (config: { origin: string; prefix: string }, token: string) =>
+  `${config.origin}${config.prefix}/login?invite=${token}`;
+
 /** The subset the admin CLI needs; no upstream required. */
 export function loadCliConfig(env: Env = process.env) {
   const origin = parseOrigin(env.ORIGIN?.trim() || 'http://localhost:3000');

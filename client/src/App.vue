@@ -19,6 +19,7 @@ const next = params.get('next') || '/';
 
 const phase = ref<Phase>('loading');
 const username = ref('');
+const isAdmin = ref(false);
 const invite = ref<InviteInfo | null>(null);
 const busy = ref<Action | null>(null);
 const status = ref<{ message: string; kind: StatusKind }>({ message: '', kind: 'info' });
@@ -74,6 +75,7 @@ onMounted(async () => {
   const session = await getSession();
   if (session.authenticated && !inviteToken) {
     username.value = session.username ?? '';
+    isAdmin.value = session.role === 'admin';
     phase.value = 'signed-in';
     return;
   }
@@ -105,6 +107,7 @@ onMounted(async () => {
       v-else-if="phase === 'signed-in'"
       :username="username"
       :app-name="appName"
+      :is-admin="isAdmin"
       :busy="busy === 'logout'"
       @continue="go(next)"
       @logout="onLogout"

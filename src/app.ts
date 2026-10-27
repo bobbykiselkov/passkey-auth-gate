@@ -2,7 +2,8 @@
 // request and WebSocket upgrade needs a signed session cookie from a
 // successful passkey sign-in, except the gate's own pages (under
 // GATE_PREFIX) and any PUBLIC_PATHS. Browsers without one are sent to the
-// login page, everything else gets a 401.
+// login page, everything else gets a 401. Admins also get a user
+// management page at GATE_PREFIX/admin, backed by GATE_PREFIX/api/admin.
 
 import { randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
@@ -24,8 +25,8 @@ import rateLimit from 'express-rate-limit';
 import session from 'express-session';
 import { createProxyMiddleware } from 'http-proxy-middleware';
 
-import type { GateConfig } from './config.js';
-import { type GateDB, InviteError, SqliteSessionStore, type User, hashToken } from './db.js';
+import { type GateConfig, inviteUrl } from './config.js';
+import { type GateDB, InviteError, LastAdminError, SqliteSessionStore, type User, hashToken, isRole } from './db.js';
 
 interface PendingChallenge {
   challenge: string;
@@ -47,10 +48,11 @@ declare module 'express-session' {
 }
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
-/** The Vue login page, built by Vite (`npm run build`). */
+/** The Vue login and admin pages, built by Vite (`npm run build`). */
 const CLIENT_DIR = path.join(ROOT, 'dist/public');
 const CHALLENGE_TTL_MS = 5 * 60_000;
 const USERNAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{1,31}$/;
+const MAX_INVITE_HOURS = 30 * 24;
 
 export class HttpError extends Error {
   constructor(
@@ -138,6 +140,7 @@ export function createGate(config: GateConfig, db: GateDB): Gate {
   }
 
   const isGatePath = (pathname: string) => pathname === P || pathname.startsWith(`${P}/`);
+  const ADMIN_PAGE = `${P}/admin`;
 
   /**
    * PUBLIC_PATHS match fails closed: anything the upstream might normalize
@@ -160,12 +163,14 @@ export function createGate(config: GateConfig, db: GateDB): Gate {
     );
   }
 
-  /** Only same-origin relative paths, so ?next= can't redirect off-site. */
+  /** Only same-origin relative paths, so ?next= can't redirect off-site.
+   * The admin page is the one gate path allowed. */
   function safeNext(next: unknown): string {
     if (typeof next !== 'string' || !next.startsWith('/')) return '/';
     try {
       const url = new URL(next, config.origin);
-      if (url.origin !== config.origin || isGatePath(url.pathname)) return '/';
+      if (url.origin !== config.origin) return '/';
+      if (isGatePath(url.pathname) && url.pathname !== ADMIN_PAGE) return '/';
       return url.pathname + url.search + url.hash;
     } catch {
       return '/';
@@ -233,25 +238,35 @@ export function createGate(config: GateConfig, db: GateDB): Gate {
     next();
   }
 
-  // The built index.html is a template: the server fills in the app name
-  // and prefix. Re-read when the file changes, so `vite build --watch`
-  // during development needs no server restart.
-  let template: { mtimeMs: number; html: string } | undefined;
-  function loginHtml(): string | undefined {
-    const file = path.join(CLIENT_DIR, 'index.html');
+  // The built pages are templates: the server fills in the app name and
+  // prefix. Re-read when a file changes, so `vite build --watch` during
+  // development needs no server restart.
+  const templates = new Map<string, { mtimeMs: number; html: string }>();
+  function pageHtml(name: 'index.html' | 'admin.html'): string | undefined {
+    const file = path.join(CLIENT_DIR, name);
     let mtimeMs: number;
     try {
       mtimeMs = statSync(file).mtimeMs;
     } catch {
       return undefined;
     }
+    let template = templates.get(name);
     if (template?.mtimeMs !== mtimeMs) {
       const html = readFileSync(file, 'utf8')
         .replaceAll('{{APP_NAME}}', escapeHtml(config.appName))
         .replaceAll('{{PREFIX}}', escapeHtml(P));
       template = { mtimeMs, html };
+      templates.set(name, template);
     }
     return template.html;
+  }
+
+  function sendPage(res: Response, name: 'index.html' | 'admin.html'): void {
+    const html = pageHtml(name);
+    if (!html) {
+      return void res.status(503).type('text').send('Pages not built yet. Run `npm run build` (or `npm run dev`).');
+    }
+    res.type('html').send(html);
   }
 
   const gate = express.Router();
@@ -270,12 +285,12 @@ export function createGate(config: GateConfig, db: GateDB): Gate {
     }),
   );
   gate.use(gateHeaders);
-  gate.get('/login', (req, res) => {
-    const html = loginHtml();
-    if (!html) {
-      return void res.status(503).type('text').send('Login page not built yet. Run `npm run build` (or `npm run dev`).');
-    }
-    res.type('html').send(html);
+  gate.get('/login', (req, res) => sendPage(res, 'index.html'));
+  gate.get('/admin', (req, res) => {
+    const user = currentUser(req);
+    if (!user) return res.redirect(302, `${P}/login?next=${encodeURIComponent(ADMIN_PAGE)}`);
+    if (user.role !== 'admin') return void res.status(403).type('text').send('Only admins can manage users.');
+    sendPage(res, 'admin.html');
   });
 
   // ---- passkey API ---------------------------------------------------------
@@ -302,7 +317,7 @@ export function createGate(config: GateConfig, db: GateDB): Gate {
 
   api.get('/session', (req, res) => {
     const user = currentUser(req);
-    res.json({ authenticated: Boolean(user), username: user?.username ?? null });
+    res.json({ authenticated: Boolean(user), username: user?.username ?? null, role: user?.role ?? null });
   });
 
   api.get('/invite', (req, res) => {
@@ -464,6 +479,108 @@ export function createGate(config: GateConfig, db: GateDB): Gate {
       res.json({ ok: true });
     });
   });
+
+  // ---- admin API -----------------------------------------------------------
+
+  // Same rate limit, Origin check and JSON parsing as the rest of the API
+  // (mounted below it); the role is re-read from the DB on every request,
+  // so a demotion takes effect immediately.
+  const admin = express.Router();
+  admin.use((req, res, next) => {
+    const user = currentUser(req);
+    if (!user) return next(new HttpError(401, 'Authentication required.'));
+    if (user.role !== 'admin') return next(new HttpError(403, 'Only admins can manage users.'));
+    res.locals.admin = user;
+    next();
+  });
+
+  function targetUser(req: Request, res: Response): User {
+    const id = Number(req.params.id);
+    const user = Number.isSafeInteger(id) ? db.getUserById(id) : undefined;
+    if (!user) throw new HttpError(404, 'No such user.');
+    // Changing your own role or account here would lock you out mid-click;
+    // another admin (or the CLI) has to do it.
+    if (user.id === (res.locals.admin as User).id) {
+      throw new HttpError(400, "You can't change your own account here. Ask another admin, or use the CLI.");
+    }
+    return user;
+  }
+
+  /** Runs a DB change that may refuse to remove the last admin. */
+  function guardLastAdmin<T>(fn: () => T): T {
+    try {
+      return fn();
+    } catch (err) {
+      if (err instanceof LastAdminError) throw new HttpError(409, err.message);
+      throw err;
+    }
+  }
+
+  admin.get('/users', (req, res) => {
+    res.json({ users: db.listUsers() });
+  });
+
+  admin.post('/users/:id/role', (req, res) => {
+    const user = targetUser(req, res);
+    const role = (req.body as { role?: unknown } | undefined)?.role;
+    if (!isRole(role)) throw new HttpError(400, 'Role must be "admin" or "user".');
+    guardLastAdmin(() => db.setRole(user.id, role));
+    log(`[admin] ${(res.locals.admin as User).username} made ${user.username} ${role}`);
+    res.json({ ok: true });
+  });
+
+  admin.delete('/users/:id', (req, res) => {
+    const user = targetUser(req, res);
+    guardLastAdmin(() => db.deleteUser(user.id));
+    log(`[admin] ${(res.locals.admin as User).username} deleted ${user.username}`);
+    res.json({ ok: true });
+  });
+
+  admin.get('/invites', (req, res) => {
+    res.json({
+      invites: db.listInvites().map((i) => ({
+        // The stored SHA-256, not the token: useless as an invite link.
+        id: i.token,
+        createdAt: i.created_at,
+        expiresAt: i.expires_at,
+        forUsername: i.for_username,
+        role: i.role,
+      })),
+    });
+  });
+
+  admin.post('/invites', (req, res) => {
+    const body = (req.body ?? {}) as { hours?: unknown; forUserId?: unknown; role?: unknown };
+    const ttlHours = body.hours === undefined ? config.inviteTtlHours : Number(body.hours);
+    if (!(ttlHours > 0 && ttlHours <= MAX_INVITE_HOURS)) {
+      throw new HttpError(400, `Expiry must be between 1 hour and ${MAX_INVITE_HOURS / 24} days.`);
+    }
+    const role = body.role ?? 'user';
+    if (!isRole(role)) throw new HttpError(400, 'Role must be "admin" or "user".');
+
+    let forUser: User | undefined;
+    if (body.forUserId !== undefined && body.forUserId !== null) {
+      forUser = db.getUserById(Number(body.forUserId));
+      if (!forUser) throw new HttpError(404, 'No such user.');
+    }
+    const token = db.createInvite({ ttlHours, forUserId: forUser?.id ?? null, role });
+    log(
+      `[admin] ${(res.locals.admin as User).username} created an invite ` +
+        (forUser ? `to add a passkey to ${forUser.username}` : `for a new ${role}`),
+    );
+    res.json({ url: inviteUrl(config, token), expiresAt: Date.now() + ttlHours * 3600_000 });
+  });
+
+  admin.delete('/invites/:id', (req, res) => {
+    if (!db.revokeInvite(String(req.params.id))) throw new HttpError(404, 'That invite was already used or revoked.');
+    res.json({ ok: true });
+  });
+
+  admin.delete('/invites', (req, res) => {
+    res.json({ ok: true, revoked: db.revokeAllInvites() });
+  });
+
+  api.use('/admin', admin);
 
   api.use((req, res) => {
     res.status(404).json({ error: 'Not found.' });

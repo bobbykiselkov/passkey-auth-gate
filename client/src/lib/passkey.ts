@@ -10,9 +10,12 @@ import {
 
 import { api } from './api';
 
+export type Role = 'admin' | 'user';
+
 export interface SessionInfo {
   authenticated: boolean;
   username: string | null;
+  role: Role | null;
 }
 
 export interface InviteInfo {
@@ -22,7 +25,7 @@ export interface InviteInfo {
 }
 
 export const getSession = () =>
-  api<SessionInfo>('session').catch((): SessionInfo => ({ authenticated: false, username: null }));
+  api<SessionInfo>('session').catch((): SessionInfo => ({ authenticated: false, username: null, role: null }));
 
 export const getInvite = (token: string) => api<InviteInfo>(`invite?token=${encodeURIComponent(token)}`);
 
