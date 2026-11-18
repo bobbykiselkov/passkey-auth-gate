@@ -37,6 +37,7 @@ function onDelete(user: AdminUser) {
           </td>
           <td>
             <select
+              class="role_select"
               :value="user.role"
               :disabled="disabled || user.username === me"
               :aria-label="`Role for ${user.username}`"
@@ -147,5 +148,17 @@ select:disabled {
   height: 1px;
   overflow: hidden;
   clip-path: inset(50%);
+}
+.role_select{
+    appearance: none; /* Disable the default arrow */
+    -webkit-appearance: none; /* For WebKit-based browsers */
+    -moz-appearance: none; /* For Firefox */
+
+    padding: 5px 35px 5px 8px;
+    background-image: url('data:image/svg+xml;utf8,<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M6 9L12 15L18 9" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke="%23e6e8ee"/></svg>');
+    background-repeat: no-repeat;
+    background-position: right 10px center;
+    background-size: 20px;
+    cursor: pointer;
 }
 </style>

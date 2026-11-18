@@ -39,14 +39,14 @@ async function copy(url: string) {
     <form class="create" @submit.prevent="emit('create', { hours, role })">
       <label>
         New account role
-        <select v-model="role" :disabled="disabled">
+        <select class="role_select" v-model="role" :disabled="disabled">
           <option value="user">User</option>
           <option value="admin">Admin</option>
         </select>
       </label>
       <label>
         Expires after
-        <select v-model.number="hours" :disabled="disabled">
+        <select class="role_select" v-model.number="hours" :disabled="disabled">
           <option :value="24">1 day</option>
           <option :value="72">3 days</option>
           <option :value="168">7 days</option>
@@ -179,6 +179,19 @@ select:disabled {
   padding: 8px 0;
   border-bottom: 1px solid var(--border);
   font-size: 0.9rem;
+}
+
+.role_select{
+    appearance: none; /* Disable the default arrow */
+    -webkit-appearance: none; /* For WebKit-based browsers */
+    -moz-appearance: none; /* For Firefox */
+
+    padding: 0px 35px 0px 8px;
+    background-image: url('data:image/svg+xml;utf8,<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M6 9L12 15L18 9" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke="%23e6e8ee"/></svg>');
+    background-repeat: no-repeat;
+    background-position: right 10px center;
+    background-size: 20px;
+    cursor: pointer;
 }
 @media (max-width: 520px) {
   .link-row {
