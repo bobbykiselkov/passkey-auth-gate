@@ -1,7 +1,7 @@
 # Build stage: compile TypeScript, then drop dev dependencies. The compiler
 # toolchain is only needed if better-sqlite3 has no prebuilt binary for the
 # target platform, and it stays out of the final image either way.
-FROM node:24-bookworm-slim AS build
+FROM node:26-bookworm-slim AS build
 WORKDIR /app
 RUN apt-get update \
  && apt-get install -y --no-install-recommends python3 make g++ \
@@ -14,7 +14,7 @@ COPY client ./client
 # Server → dist/*.js, Vue login page → dist/public (Vite).
 RUN npm run build && npm prune --omit=dev
 
-FROM node:24-bookworm-slim
+FROM node:26-bookworm-slim
 ENV NODE_ENV=production \
     DATA_DIR=/data \
     PORT=3000
