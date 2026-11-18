@@ -30,15 +30,15 @@
     "@types/better-sqlite3": "^9.6.0",
     "@types/express": "^5.0.6",
     "@types/express-session": "^1.19.0",
-    "@types/node": "^22.20.5",
+    "@types/node": "^26.6.6",
     "@types/ws": "^8.18.2",
-    "@vitejs/plugin-vue": "^6.0.9",
-    "concurrently": "^10.0.6",
+    "@vitejs/plugin-vue": "^6.0.11",
+    "concurrently": "^10.0.7",
     "tsx": "^4.23.15",
-    "typescript": "~6.0.3",
+    "typescript": "~7.0.2",
     "vite": "^8.3.4",
-    "vue": "^3.5.43",
+    "vue": "^3.5.45",
     "vue-tsc": "^3.3.12",
-    "ws": "^8.22.0"
+    "ws": "^8.23.0"
   }
 }
